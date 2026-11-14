@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: rea-intelligence-mcp
+    runtime: node
+    plan: free
+    region: frankfurt
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: 24.22.1
+      - key: REA_PACKAGE
+        value: rea-agents@6.9.0
+      - key: HOST
+        value: 0.0.0.0
