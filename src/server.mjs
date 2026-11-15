@@ -1,113 +1,197 @@
 import express from "express";
-import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 
 const HOST = process.env.HOST ?? "0.0.0.0";
 const PORT = Number(process.env.PORT ?? 10000);
+const REA_HTTP_HOST = "127.0.0.1";
+const REA_HTTP_PORT = Number(process.env.REA_HTTP_PORT ?? 10001);
 const REA_PACKAGE = "rea-agents@6.9.0";
-const REA_BIN = process.env.REA_BIN ?? fileURLToPath(new URL("../node_modules/.bin/rea", import.meta.url));
+const REA_ENTRY = fileURLToPath(
+  new URL("../node_modules/rea-agents/scripts/rea.mjs", import.meta.url)
+);
+
 const app = express();
-app.use(express.json({ limit: "25mb" }));
-const sessions = new Map();
+app.use(express.json({ limit: "4mb" }));
 
-function reaCommand() {
-  return { command: REA_BIN, args: ["mcp"] };
-}
+let reaReady = false;
+let shuttingDown = false;
+let reaExit = null;
 
-async function closeSession(id, session) {
-  if (id) sessions.delete(id);
-  try { await session.mcpServer?.close(); } catch {}
-  try { await session.reaClient?.close(); } catch {}
-  try { await session.reaTransport?.close(); } catch {}
-}
+const rea = spawn(
+  process.execPath,
+  [
+    REA_ENTRY,
+    "mcp",
+    "--http",
+    "--host",
+    REA_HTTP_HOST,
+    "--port",
+    String(REA_HTTP_PORT)
+  ],
+  {
+    env: { ...process.env, REA_LOG_LEVEL: process.env.REA_LOG_LEVEL ?? "info" },
+    stdio: ["ignore", "ignore", "pipe"]
+  }
+);
 
-async function createSession() {
-  const { command, args } = reaCommand();
-  const reaTransport = new StdioClientTransport({
-    command, args, env: process.env, stderr: "inherit"
-  });
-  const reaClient = new Client(
-    { name: "rea-chatgpt-gateway", version: "1.0.0" }, { capabilities: {} }
-  );
-  await reaClient.connect(reaTransport);
-
-  const mcpServer = new Server(
-    { name: "rea-chatgpt-connector", version: "1.0.0" },
-    { capabilities: { tools: {} } }
-  );
-  mcpServer.setRequestHandler(ListToolsRequestSchema, async () => reaClient.listTools());
-  mcpServer.setRequestHandler(CallToolRequestSchema, async ({ params }) =>
-    reaClient.callTool({ name: params.name, arguments: params.arguments ?? {} })
-  );
-
-  const session = { reaTransport, reaClient, mcpServer, httpTransport: null };
-  const httpTransport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => randomUUID(),
-    onsessioninitialized: id => sessions.set(id, session)
-  });
-  session.httpTransport = httpTransport;
-  httpTransport.onclose = async () => {
-    const entry = [...sessions.entries()].find(([, value]) => value === session);
-    await closeSession(entry?.[0], session);
-  };
-  await mcpServer.connect(httpTransport);
-  return session;
-}
-
-app.get("/health", (_req, res) => res.json({
-  status: "ok", service: "rea-chatgpt-connector",
-  transport: "streamable-http", upstream: REA_PACKAGE
-}));
-
-async function handleMcp(req, res) {
-  try {
-    const id = req.header("mcp-session-id");
-    let session = id ? sessions.get(id) : undefined;
-    if (!session && req.method === "POST" && !id) {
-      if (req.body?.method !== "initialize") {
-        res.status(400).json({ error: "First request must initialize an MCP session." });
-        return;
+let stderrBuffer = "";
+rea.stderr.setEncoding("utf8");
+rea.stderr.on("data", chunk => {
+  stderrBuffer += chunk;
+  const lines = stderrBuffer.split(/\r?\n/);
+  stderrBuffer = lines.pop() ?? "";
+  for (const line of lines) {
+    if (!line) continue;
+    console.log(`[REA] ${line}`);
+    try {
+      const event = JSON.parse(line);
+      if (event.msg === "MCP transport listening" && event.url) {
+        reaReady = true;
+        console.log(`REA native MCP ready at ${event.url}`);
       }
-      session = await createSession();
+    } catch {
+      // REA may emit human-readable diagnostics alongside structured logs.
     }
-    if (!session) {
-      res.status(404).json({ error: "Unknown MCP session. Initialize a new session." });
+  }
+});
+
+rea.on("error", error => {
+  console.error("[REA process error]", error);
+  reaExit = error;
+  reaReady = false;
+  if (!shuttingDown) process.exit(1);
+});
+
+rea.on("exit", (code, signal) => {
+  reaReady = false;
+  reaExit = new Error(`REA exited (code=${code}, signal=${signal})`);
+  console.error("[REA process exit]", reaExit.message);
+  if (!shuttingDown) process.exit(1);
+});
+
+const startupTimer = setTimeout(() => {
+  console.error("REA did not announce its native MCP HTTP listener within 60 seconds.");
+  process.exit(1);
+}, 60_000);
+
+const readinessPoll = setInterval(() => {
+  if (reaReady) {
+    clearTimeout(startupTimer);
+    clearInterval(readinessPoll);
+  }
+}, 100);
+
+app.get("/health", (_req, res) => {
+  if (!reaReady || reaExit) {
+    res.status(503).json({
+      status: "starting",
+      upstream: REA_PACKAGE,
+      error: reaExit?.message
+    });
+    return;
+  }
+  res.json({
+    status: "ok",
+    service: "rea-chatgpt-connector",
+    transport: "streamable-http",
+    upstream: REA_PACKAGE
+  });
+});
+
+app.all("/mcp", async (req, res) => {
+  if (!reaReady) {
+    res.status(503).json({ error: "REA MCP server is starting." });
+    return;
+  }
+
+  try {
+    const headers = new Headers();
+    for (const name of [
+      "accept",
+      "content-type",
+      "mcp-session-id",
+      "mcp-protocol-version",
+      "last-event-id"
+    ]) {
+      const value = req.header(name);
+      if (value) headers.set(name, value);
+    }
+
+    const init = {
+      method: req.method,
+      headers,
+      signal: AbortSignal.timeout(120_000)
+    };
+    if (req.method === "POST" && req.body !== undefined) {
+      init.body = JSON.stringify(req.body);
+      if (!headers.has("content-type")) {
+        headers.set("content-type", "application/json");
+      }
+    }
+
+    const upstream = await fetch(
+      `http://${REA_HTTP_HOST}:${REA_HTTP_PORT}/mcp`,
+      init
+    );
+
+    res.status(upstream.status);
+    for (const name of [
+      "content-type",
+      "cache-control",
+      "mcp-session-id",
+      "mcp-protocol-version"
+    ]) {
+      const value = upstream.headers.get(name);
+      if (value) res.setHeader(name, value);
+    }
+
+    if (!upstream.body) {
+      res.end();
       return;
     }
-    await session.httpTransport.handleRequest(req, res, req.body);
-  } catch (err) {
-    console.error("[REA MCP gateway]", err);
-    if (!res.headersSent) res.status(500).json({
-      error: "REA MCP gateway error",
-      message: err instanceof Error ? err.message : String(err)
-    });
+    await pipeline(Readable.fromWeb(upstream.body), res);
+  } catch (error) {
+    console.error("[MCP proxy error]", error);
+    if (!res.headersSent) {
+      res.status(502).json({
+        error: "Unable to reach the REA MCP runtime.",
+        message: error instanceof Error ? error.message : String(error)
+      });
+    } else {
+      res.destroy(error);
+    }
   }
-}
-
-app.post("/mcp", handleMcp);
-app.get("/mcp", handleMcp);
-app.delete("/mcp", async (req, res) => {
-  const id = req.header("mcp-session-id");
-  const session = id ? sessions.get(id) : undefined;
-  if (!session) return res.status(404).json({ error: "Unknown MCP session" });
-  await session.httpTransport.handleRequest(req, res, req.body);
 });
 
 const server = app.listen(PORT, HOST, () => {
-  console.log(`REA MCP listening on ${HOST}:${PORT}/mcp`);
+  console.log(`REA gateway listening on ${HOST}:${PORT}`);
   console.log(`Health check: ${HOST}:${PORT}/health`);
-  console.log(`Upstream: ${REA_PACKAGE} (preinstalled)`);
-  console.log(`REA executable: ${REA_BIN}`);
+  console.log(`Upstream: ${REA_PACKAGE} native Streamable HTTP`);
+  console.log(`REA entry: ${REA_ENTRY}`);
 });
 
 async function shutdown() {
-  for (const [id, session] of [...sessions.entries()]) await closeSession(id, session);
-  server.close(() => process.exit(0));
+  if (shuttingDown) return;
+  shuttingDown = true;
+  clearTimeout(startupTimer);
+  clearInterval(readinessPoll);
+  reaReady = false;
+  server.close();
+  if (rea.exitCode === null && rea.signalCode === null) {
+    rea.kill("SIGTERM");
+    await new Promise(resolve => {
+      const timer = setTimeout(resolve, 10_000);
+      rea.once("exit", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+  }
+  process.exit(0);
 }
+
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
