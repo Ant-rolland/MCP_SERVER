@@ -1,45 +1,78 @@
 # REA → ChatGPT MCP connector
 
-Minimal Streamable HTTP gateway forwarding the official REA MCP tools.
-It does not fork or reimplement REA.
+A remote Streamable HTTP gateway for the official REA MCP server. This repository does not fork or reimplement REA.
 
-Upstream: https://github.com/morluto/rea  
-Pinned npm release: `rea-agents@6.9.0`
+- Upstream: https://github.com/morluto/rea
+- Pinned release: `rea-agents@6.9.0`
+- Production endpoint: https://rea-intelligence-mcp.onrender.com/mcp
+- Health endpoint: https://rea-intelligence-mcp.onrender.com/health
 
-## Deploy without a terminal
+## Runtime architecture
 
-1. Open `https://github.com/Ant-rolland/MCP_SERVER`.
-2. Choose **Add file → Upload files**.
-3. Upload the contents of this folder (not the ZIP archive) to the repository root.
-4. Commit to `main`.
-5. Open the `REA Intelligence` workspace in Render.
-6. Choose **New → Blueprint**, select `MCP_SERVER`, review the service and apply.
-7. Wait until the service is Live.
+The Render web service runs a small Express gateway and starts the installed REA package directly through Node:
 
-Render URL will resemble `https://rea-intelligence-mcp.onrender.com`.
+1. REA runs its native `rea mcp --http` Streamable HTTP server on loopback only.
+2. The public Express gateway proxies MCP requests to that local listener.
+3. `/health` reports healthy only after REA announces that its MCP listener is ready.
+4. The gateway preserves MCP session and protocol headers and streams responses.
 
-- MCP endpoint: `https://rea-intelligence-mcp.onrender.com/mcp`
-- Health: `https://rea-intelligence-mcp.onrender.com/health`
+This uses REA's native HTTP transport rather than maintaining a second MCP server implementation or launching `npx` for every client session.
 
-## Connect in ChatGPT
+## Deployment
 
-1. ChatGPT Web → Plugins → `+` → Add custom MCP server.
-2. Name: `REA Reverse Engineering`.
-3. Server URL: the HTTPS address ending in `/mcp`.
-4. Authentication: No authentication (initial personal test only).
-5. Review the warning, then Create as a plugin.
-6. Review discovered tools and install.
+Render is connected to the `main` branch and deploys automatically.
 
-## Important limitations and security
+- Runtime: Node.js 24.22.1
+- Build command: `npm install`
+- Start command: `npm start`
+- Health check: `/health`
+- Region: Frankfurt
+- Plan: Render Free
 
-- This first deployment has no authentication. Its public URL can be called by anyone who discovers it. Use only for a controlled test; add OAuth before sharing or using sensitive workflows.
-- REA runs inside Render, not on the user's Windows computer. It cannot read files from the PC. Local-path tools can only access files in the Render container.
-- For Android APKs or local JavaScript bundles, a secure upload/storage flow or a local Secure MCP Tunnel will be needed.
-- Render Free services sleep when idle and may have cold starts.
-- REA's native analysis engines depend on what is installed in the runtime. This gateway does not install Ghidra, JADX, Android SDK or other native engines.
-- All upstream REA tools are forwarded. JavaScript, Web and Android are the initial target domains, not a hard filter on tool names.
+## Verification
 
-## Runtime
+GitHub Actions runs `npm run test:smoke` after pushes to `main`. The test:
 
-Node 24.22.1 · Streamable HTTP `/mcp` · health `/health`  
-Upstream command: `npx -y rea-agents@6.9.0 mcp`
+- waits for the Render health endpoint;
+- initializes an MCP session through the public HTTPS endpoint;
+- calls `tools/list`;
+- fails if REA exposes no tools.
+
+The deployed release has passed the smoke test with **255 REA tools discovered**. See the [latest successful workflow](https://github.com/Ant-rolland/MCP_SERVER/actions/runs/43759896371).
+
+Run the same test locally against a deployed instance:
+
+```bash
+npm install
+MCP_URL=https://rea-intelligence-mcp.onrender.com npm run test:smoke
+```
+
+## ChatGPT compatibility
+
+The endpoint implements Streamable HTTP at `/mcp`, which is the remote MCP transport expected by ChatGPT's custom MCP server connection flow.
+
+Current OpenAI plan availability is separate from server compatibility:
+- Business and Enterprise/Edu: full custom MCP support on ChatGPT web.
+- Pro: custom MCP connections with read/fetch permissions.
+- Free: custom MCP server connections are not currently listed as supported.
+
+See the [OpenAI connection guide](https://help.openai.com/en/articles/12584461-connecting-custom-mcp-servers-in-chatgpt).
+
+## Security status — prototype only
+
+**The deployed service currently has no authentication.** Render allows inbound traffic from `0.0.0.0/0`, and all upstream REA tools are exposed through the public endpoint. Do not use it with sensitive files, credentials, or workflows, and do not share the endpoint as a production service.
+
+Before production use, implement OAuth 2.1 for MCP with protected-resource metadata, an authorization server, and per-request access-token validation. A static API key or bearer token is not a supported substitute for ChatGPT MCP authentication. See the [OpenAI MCP authentication guide](https://developers.openai.com/plugins/build/auth).
+
+## Runtime limitations
+
+- REA runs inside Render, not on the user's Windows computer. It cannot access local PC paths. Local-path tools can only access files uploaded to or present in the Render container.
+- A secure upload/storage flow or a local Secure MCP Tunnel is needed for APKs and JavaScript bundles stored on the PC.
+- Render Free services can sleep when idle and have cold starts.
+- REA's native analysis engines depend on what is installed in the runtime. This deployment does not install Ghidra, JADX, Android SDK, Hopper, or other external analysis engines.
+- All 255 upstream tools are forwarded; this deployment does not currently filter tool families or restrict write-capable tools.
+
+## Repository scripts
+
+- `npm start`: starts the gateway and the native REA HTTP runtime.
+- `npm run test:smoke`: checks health, MCP initialization, and tool discovery.
