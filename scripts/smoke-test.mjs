@@ -27,31 +27,47 @@ async function waitForHealth() {
     } catch (error) {
       lastError = error;
     }
-    console.log(`Waiting for Render (${attempt}/${attempts}): ${lastError.message}`);
+    console.log(`Waiting for Render health (${attempt}/${attempts}): ${lastError.message}`);
     if (attempt < attempts) await sleep(delayMs);
   }
   throw new Error(`Service did not become healthy: ${lastError?.message ?? "unknown error"}`);
 }
 
-await waitForHealth();
-
-const client = new Client(
-  { name: "rea-mcp-smoke-test", version: "1.0.0" },
-  { capabilities: {} }
-);
-const transport = new StreamableHTTPClientTransport(mcpUrl);
-
-try {
-  await client.connect(transport);
-  const result = await client.listTools();
-  const tools = result.tools ?? [];
-
-  if (tools.length === 0) {
-    throw new Error("MCP connected, but REA returned no tools.");
-  }
-
-  console.log(`MCP initialize passed. REA exposed ${tools.length} tools.`);
-  console.log("Sample tools:", tools.slice(0, 10).map(tool => tool.name).join(", "));
-} finally {
-  await client.close().catch(() => {});
+function isTransient(error) {
+  const message = String(error?.message ?? error);
+  return /HTTP 502|HTTP 503|HTTP 504|502|503|504|fetch failed|ECONNRESET|ECONNREFUSED|socket hang up|timed out/i.test(message);
 }
+
+async function verifyMcp() {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const client = new Client(
+      { name: "rea-mcp-smoke-test", version: "1.0.0" },
+      { capabilities: {} }
+    );
+    const transport = new StreamableHTTPClientTransport(mcpUrl);
+    try {
+      await client.connect(transport);
+      const result = await client.listTools();
+      const tools = result.tools ?? [];
+      if (tools.length === 0) {
+        throw new Error("MCP connected, but REA returned no tools.");
+      }
+      console.log(`MCP initialize passed. REA exposed ${tools.length} tools.`);
+      console.log("Sample tools:", tools.slice(0, 10).map(tool => tool.name).join(", "));
+      return;
+    } catch (error) {
+      lastError = error;
+      if (!isTransient(error)) throw error;
+      console.log(`MCP endpoint is restarting or unavailable (${attempt}/${attempts}): ${String(error.message).split("\n")[0]}`);
+    } finally {
+      await client.close().catch(() => {});
+      await transport.close().catch(() => {});
+    }
+    if (attempt < attempts) await sleep(delayMs);
+  }
+  throw new Error(`MCP did not become ready: ${lastError?.message ?? "unknown error"}`);
+}
+
+await waitForHealth();
+await verifyMcp();
