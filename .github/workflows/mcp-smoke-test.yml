@@ -1,0 +1,28 @@
+name: MCP deployment smoke test
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-test:
+    name: Verify deployed MCP endpoint
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+      - name: Initialize MCP and list REA tools
+        run: npm run test:smoke
+        env:
+          MCP_URL: https://rea-intelligence-mcp.onrender.com
