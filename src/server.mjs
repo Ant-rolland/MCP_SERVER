@@ -1,5 +1,6 @@
 import express from "express";
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -8,17 +9,14 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 
 const HOST = process.env.HOST ?? "0.0.0.0";
 const PORT = Number(process.env.PORT ?? 10000);
-const REA_PACKAGE = process.env.REA_PACKAGE ?? "rea-agents@6.9.0";
+const REA_PACKAGE = "rea-agents@6.9.0";
+const REA_BIN = process.env.REA_BIN ?? fileURLToPath(new URL("../node_modules/.bin/rea", import.meta.url));
 const app = express();
 app.use(express.json({ limit: "25mb" }));
 const sessions = new Map();
 
 function reaCommand() {
-  if (process.platform === "win32") {
-    return { command: process.env.COMSPEC ?? "cmd.exe",
-      args: ["/d", "/s", "/c", `npx -y ${REA_PACKAGE} mcp`] };
-  }
-  return { command: process.env.NPX_PATH ?? "npx", args: ["-y", REA_PACKAGE, "mcp"] };
+  return { command: REA_BIN, args: ["mcp"] };
 }
 
 async function closeSession(id, session) {
@@ -103,7 +101,8 @@ app.delete("/mcp", async (req, res) => {
 const server = app.listen(PORT, HOST, () => {
   console.log(`REA MCP listening on ${HOST}:${PORT}/mcp`);
   console.log(`Health check: ${HOST}:${PORT}/health`);
-  console.log(`Upstream: ${REA_PACKAGE}`);
+  console.log(`Upstream: ${REA_PACKAGE} (preinstalled)`);
+  console.log(`REA executable: ${REA_BIN}`);
 });
 
 async function shutdown() {
